@@ -1,0 +1,58 @@
+# Статика без сборки: публикуем корень проекта (или dist при сборке)
+[build]
+  publish = "."
+
+# Заголовки безопасности и управление кешированием
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+
+# HTML страницы не кешируем, чтобы игроки всегда получали актуальную версию игры и лобби
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/game.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# Статические ресурсы (стили, скрипты)
+[[headers]]
+  for = "/css/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+[[headers]]
+  for = "/js/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
+# Прямые ссылки и удобные алиасы
+[[redirects]]
+  from = "/play"
+  to = "/game.html"
+  status = 302
+
+[[redirects]]
+  from = "/coop"
+  to = "/index.html"
+  status = 302
+
+# Поддержка прямых ссылок на подключение к комнате: /join/:code -> /game.html?join=:splat
+[[redirects]]
+  from = "/join/:code"
+  to = "/game.html?join=:code"
+  status = 302
+
+# Fallback для неизвестных путей (SPA-поведение)
+# В Netlify существующие файлы отдаются первыми, а несуществующие перенаправляются на index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

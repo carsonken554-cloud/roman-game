@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>РОМАН: Пиксельное Приключение</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="wrap">
+  <div id="screen">
+    <canvas id="game" width="320" height="180"></canvas>
+    <canvas id="ui" width="960" height="540"></canvas>
+    <div id="crt"></div>
+  </div>
+  <div id="hint">WASD/стрелки — ходьба &middot; E — диалог &middot; ПРОБЕЛ — удар &middot; F — сферомёт &middot; Q — белая жижа &middot; SHIFT — велик &middot; TAB — квесты &middot; M — звук &middot; ESC — пауза &middot; F11/двойной клик — полный экран &middot; кооп — на главной</div>
+</div>
+<script src="js/sprites.js"></script>
+<script src="js/world.js"></script>
+<script src="js/dialogs.js"></script>
+<script src="js/game.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/render.js"></script>
+<script src="js/peerjs.min.js"></script>
+<script>if (typeof Peer === 'undefined') document.write('<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"><\/script>');</script>
+<script src="js/network.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
