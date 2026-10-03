@@ -1,106 +1,400 @@
-/* ============================================================
-   РОМАН: ПИКСЕЛЬНОЕ ПРИКЛЮЧЕНИЕ — network.js
-   Кооп на до 5 игроков: PeerJS (WebRTC), P2P.
-   Хост — авторитарен (симулирует мир, врагов, HP, квесты).
-   Гость — тонкий клиент: локальный предикшн + снапшоты хоста
-   с плавной интерполяцией движения (без рывков/телепортаций).
-   ============================================================ */
+/* Native WebRTC, host-authoritative co-op (one host + four guests).
+ * BroadcastChannel handles same-origin tabs without any server. MQTT carries
+ * discovery/SDP/ICE only; game packets ALWAYS use encrypted RTCDataChannels.
+ * Optional TURN: set RP.NET_ICE before loading this file (never embed secrets).
+ */
 var RP = (typeof window !== 'undefined')
-  ? (window.RP = window.RP || {})
-  : (globalThis.RP = globalThis.RP || {});
-
-var NET = {
-  mode: 'solo',            /* solo | host | client */
-  status: '',              /* '' | connecting | open | error */
-  statusText: '',
-  code: '',
-  peer: null,
-  conn: null,              /* client: соединение с хостом */
-  conns: {},               /* host: guestId -> conn */
-  myId: 0,                 /* client: свой id */
-  nextId: 1,
-  snapT: 0,
-  mvT: 0,
-  hiT: 0,
-  lastMv: '',
-  dlgCb: {},               /* host: guestPeer -> cb отложенного диалога */
-  remoteDlg: null,         /* host: сущность гостя, чей диалог активен */
-  pendingGuests: [],
-  rate: {},                /* host: guestPeer -> {n,t} rate-limit */
-  ended: false,
-  hardSnap: false,
-  overPrev: false,
-  watchdogTimer: null,
-  keepaliveTimer: null
-};
-
-/* Расширенный пул надёжных публичных STUN-серверов (Google, Cloudflare, Mozilla, Twilio) */
-var NET_ICE = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
+  ? (window.RP = window.RP || {}) : (globalThis.RP = globalThis.RP || {});
+var NET_ICE = RP.NET_ICE || [
   { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.services.mozilla.com' },
-  { urls: 'stun:global.stun.twilio.com:3478' }
+  { urls: 'stun:stun.l.google.com:19302' }
 ];
-
 var NET_AL = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-
-/* ---------- Утилиты передачи данных ---------- */
+var NET = RP.NET = {
+  mode: 'solo', status: '', statusText: '', code: '', err: '',
+  conn: null, conns: {}, peers: {}, myId: 0, nextId: 1,
+  snapT: 0, mvT: 0, hiT: 0, lastMv: '', inputSeq: 0,
+  snapSeq: 0, lastSnap: -1, zoneEpoch: 0, lastEpoch: -1,
+  dlgCb: {}, remoteDlg: null, pendingGuests: [], rate: {},
+  ended: false, hardSnap: false, overPrev: false, selfTarget: null,
+  watchdogTimer: null, keepaliveTimer: null, timers: [],
+  bc: null, brokers: [], signalsActive: false, seen: new Map(), earlyICE: new Map(),
+  generation: 0, session: '', signalSeq: 0, ping: null,
+  signalStatus: '',
+  brokerURLs: ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
+};
+NET.now = function () { return performance.now() / 1000; };
+NET.token = function () {
+  var a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, function (v) { return v.toString(16).padStart(2, '0'); }).join('');
+};
 NET.normCode = function (s) {
   return String(s || '').toUpperCase().trim().replace(/[^A-Z0-9]/g, '').slice(0, 6);
 };
-
+NET.genCode = function () {
+  var a = new Uint8Array(6);
+  crypto.getRandomValues(a);
+  return Array.from(a, function (v) { return NET_AL[v % NET_AL.length]; }).join('');
+};
+NET.later = function (fn, ms) {
+  var gen = NET.generation;
+  var t = setTimeout(function () {
+    var i = NET.timers.indexOf(t);
+    if (i >= 0) NET.timers.splice(i, 1);
+    if (gen === NET.generation) fn();
+  }, ms);
+  NET.timers.push(t);
+  return t;
+};
 NET.sendTo = function (conn, obj) {
-  if (!conn) return false;
+  if (!conn || conn.closed) return false;
+  var transient = obj.t === 's' || obj.t === 'mv';
+  var dc = transient ? conn.fast : conn.dc;
+  if (!dc || dc.readyState !== 'open') return false;
+  // Drop replaceable packets instead of building a queue of old world states.
+  if (dc.bufferedAmount > (transient ? 65536 : 262144)) {
+    if (!transient) NET.connectionError(conn, 'Соединение перегружено.');
+    return false;
+  }
   try {
-    if (conn.open === false) return false;
-    conn.send(obj);
+    var data = JSON.stringify(obj);
+    var limit = conn.pc.sctp && conn.pc.sctp.maxMessageSize;
+    var bytes = new TextEncoder().encode(data).length;
+    if (bytes > Math.min(limit || 60000, 60000)) {
+      NET.connectionError(conn, 'Сетевой пакет слишком большой.');
+      return false;
+    }
+    dc.send(data);
     return true;
   } catch (e) { return false; }
 };
-
 NET.send = function (obj) { return NET.sendTo(NET.conn, obj); };
-
 NET.sendCmd = function (k) {
-  if (NET.status === 'open') NET.send({ t: 'cmd', k: k });
+  if (NET.mode === 'client' && NET.status === 'open') NET.send({ t: 'cmd', k: k });
 };
-
-NET.countGuests = function () {
-  var n = 0;
-  for (var k in NET.conns) n++;
-  return n;
-};
-
+NET.countGuests = function () { return Object.keys(NET.conns).length; };
 NET.updStatus = function () {
-  if (NET.mode !== 'host') return;
+  if (NET.mode !== 'host' || NET.status === 'error') return;
   var n = NET.countGuests() + 1;
-  NET.statusText = n > 1
-    ? ('КОМНАТА ' + NET.code + ' · ИГРОКОВ: ' + n)
-    : ('КОМНАТА ' + NET.code + ' · ЖДЁМ ДРУЗЕЙ…');
+  NET.statusText = 'КОМНАТА ' + NET.code + (n > 1 ? ' · ИГРОКОВ: ' + n : ' · ЖДЁМ ДРУЗЕЙ…');
 };
-
+NET.closeSignals = function () {
+  NET.signalsActive = false;
+  if (NET.bc) { NET.bc.close(); NET.bc = null; }
+  NET.brokers.forEach(function (b) {
+    b.ready = false;
+    if (b.client) {
+      b.client.onConnectionLost = function () {};
+      b.client.onMessageArrived = function () {};
+      try { b.client.disconnect(); } catch (e) { }
+    }
+  });
+  NET.brokers = [];
+};
+NET.cleanup = function () {
+  NET.generation++;
+  NET.timers.forEach(clearTimeout); NET.timers = [];
+  clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null;
+  clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null;
+  NET.closeSignals();
+  Object.keys(NET.peers).forEach(function (k) { NET.closeConn(NET.peers[k]); });
+  NET.peers = {}; NET.conns = {}; NET.conn = null;
+  NET.pendingGuests = []; NET.dlgCb = {}; NET.rate = {};
+  NET.remoteDlg = null; NET.selfTarget = null;
+  NET.seen.clear(); NET.earlyICE.clear();
+  if (typeof remotePlayers !== 'undefined') remotePlayers = {};
+};
 NET.fail = function (msg) {
-  if (NET.watchdogTimer) { clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null; }
-  NET.status = 'error';
-  NET.err = msg || 'Ошибка сети';
-  NET.statusText = NET.err;
-  try { if (NET.peer) NET.peer.destroy(); } catch (e) { }
-  try { if (NET.conn && NET.conn.close) NET.conn.close(); } catch (e) { }
+  NET.cleanup();
+  NET.status = 'error'; NET.err = msg || 'Ошибка сети'; NET.statusText = NET.err;
+  if (typeof state !== 'undefined') state = 'title';
 };
-
 NET.leave = function () {
-  if (NET.watchdogTimer) { clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null; }
-  if (NET.keepaliveTimer) { clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null; }
-  try { if (NET.peer) NET.peer.destroy(); } catch (e) { }
-  var url = 'index.html';
-  if (NET.err) url += '?err=' + encodeURIComponent(NET.err);
-  if (typeof location !== 'undefined') location.href = url;
+  var err = NET.err;
+  NET.cleanup(); NET.mode = 'solo'; NET.status = ''; NET.code = '';
+  if (typeof location !== 'undefined') location.href = 'index.html' + (err ? '?err=' + encodeURIComponent(err) : '');
+};
+NET.boot = function () {
+  if (NET.mode !== 'solo') return;
+  var q = new URLSearchParams(window.location.search);
+  if (q.has('host')) NET.startHost(q.get('host'));
+  else if (q.has('join')) NET.startClient(q.get('join'));
+};
+NET.start = function (mode, code) {
+  NET.cleanup(); NET.mode = mode; NET.code = NET.normCode(code);
+  NET.err = ''; NET.status = 'connecting';
+  NET.statusText = 'ПОДКЛЮЧЕНИЕ К КОМНАТЕ ' + NET.code + '…';
+  NET.myId = 0; NET.nextId = 1; NET.snapSeq = 0; NET.lastSnap = -1;
+  NET.zoneEpoch = 0; NET.lastEpoch = -1; NET.inputSeq = 0;
+  NET.snapT = NET.mvT = 0; NET.lastMv = ''; NET.ping = null;
+  NET.ended = NET.overPrev = NET.hardSnap = false;
+  if (!/^[A-Z0-9]{6}$/.test(NET.code)) { NET.fail('Введите код комнаты из 6 символов.'); return false; }
+  if (typeof RTCPeerConnection === 'undefined') { NET.fail('Этот браузер не поддерживает WebRTC.'); return false; }
+  NET.session = NET.token(); NET.signalSeq = 0;
+  return true;
+};
+NET.startHost = function (code) {
+  if (!NET.start('host', code || NET.genCode())) return;
+  // main.boot invokes this after sprites, input and saves have been initialized.
+  try {
+    if (!G || !zone) {
+      if (typeof saveExists !== 'undefined' && saveExists) continueGame();
+      else newGame();
+    }
+    if (state === 'title') state = 'play';
+    NET.openSignals(); NET.status = 'open'; NET.updStatus();
+  } catch (e) { NET.fail('Не удалось запустить комнату: ' + e.message); }
+};
+NET.startClient = function (code) {
+  if (!NET.start('client', code)) return;
+  state = 'title';
+  NET.watchdogTimer = NET.later(function () {
+    if (NET.status !== 'open') NET.fail('Не удалось подключиться к ' + NET.code + '. Проверьте код, доступность брокеров и сеть хоста. NAT может требовать TURN.');
+  }, 30000);
+  NET.openSignals();
 };
 
-/* ---------- Сущность сетевого игрока ---------- */
+/* Signaling: subscribe before publishing; use both brokers so asymmetric
+ * reachability cannot strand host and guest on different fallback servers.
+ * Primary starts first, backup shortly afterwards. Repeated discovery resends
+ * descriptions (including gathered candidates); unique mids deduplicate paths.
+ */
+NET.signal = function (type, to, body, conn) {
+  var m = { v: 1, room: NET.code, from: NET.session, to: to || '*',
+    mid: NET.session + ':' + (++NET.signalSeq), type: type, body: body || {} };
+  if (NET.bc) { try { NET.bc.postMessage(m); } catch (e) { } }
+  if (conn && conn.local) return;
+  var payload = JSON.stringify(m);
+  NET.brokers.forEach(function (b) {
+    if (!b.ready) return;
+    try {
+      var msg = new Paho.MQTT.Message(payload);
+      msg.destinationName = NET.topic; msg.qos = 1; msg.retained = false;
+      b.client.send(msg);
+    } catch (e) { b.ready = false; }
+  });
+};
+NET.discover = function () {
+  if (NET.mode === 'client' && NET.status === 'connecting' && !(NET.conn && NET.conn.open)) {
+    NET.signal('join', '*');
+    if (NET.conn) NET.describe(NET.conn);
+  }
+};
+NET.openSignals = function () {
+  NET.signalsActive = true;
+  NET.topic = 'rpx/v1/room/' + NET.code;
+  NET.signalStatus = 'local';
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      NET.bc = new BroadcastChannel('rpx_sig_' + NET.code);
+      NET.bc.onmessage = function (e) { NET.receiveSignal(e.data, 'local'); };
+    } catch (e) { NET.bc = null; }
+  }
+  NET.discover();
+  NET.keepaliveTimer = setInterval(NET.discover, 1500);
+  // Give same-browser tabs first chance: no STUN dependency on the local path.
+  NET.later(function () {
+    if (NET.mode === 'client' && NET.conn && NET.conn.local) return;
+    NET.connectBroker(0);
+  }, 350);
+  NET.later(function () {
+    if (NET.mode === 'client' && NET.conn && NET.conn.local) return;
+    NET.connectBroker(1);
+  }, 1100);
+};
+NET.connectBroker = function (index) {
+  if (!NET.signalsActive || (NET.mode === 'client' && NET.status !== 'connecting')) return;
+  if (typeof Paho === 'undefined' || !Paho.MQTT) {
+    NET.signalStatus = 'MQTT-клиент не загружен; доступен локальный сигналинг'; return;
+  }
+  var b = NET.brokers[index] || (NET.brokers[index] = { ready: false, attempts: 0 });
+  var gen = NET.generation, client;
+  function retry() {
+    if (gen !== NET.generation || !NET.signalsActive || b.client !== client || b.retrying) return;
+    b.ready = false; b.retrying = true;
+    NET.signalStatus = 'Брокер недоступен; повторное подключение';
+    NET.later(function () {
+      b.retrying = false;
+      if (NET.mode === 'host' || NET.status === 'connecting') NET.connectBroker(index);
+    }, Math.min(15000, 1000 * Math.pow(2, Math.min(++b.attempts, 4))));
+  }
+  try {
+    client = new Paho.MQTT.Client(NET.brokerURLs[index], 'rpx_' + NET.session + '_' + index);
+    b.client = client;
+    client.onConnectionLost = retry;
+    client.onMessageArrived = function (msg) {
+      if (gen !== NET.generation || msg.retained || msg.destinationName !== NET.topic || msg.payloadString.length > 65536) return;
+      try { NET.receiveSignal(JSON.parse(msg.payloadString), 'mqtt'); } catch (e) { }
+    };
+    client.connect({ useSSL: true, mqttVersion: 4, cleanSession: true,
+      timeout: 7, keepAliveInterval: 20,
+      onFailure: retry,
+      onSuccess: function () {
+        if (gen !== NET.generation || !NET.signalsActive || NET.brokers[index] !== b) { try { client.disconnect(); } catch (e) { } return; }
+        client.subscribe(NET.topic, { qos: 1, timeout: 5, onFailure: function () {
+          try { client.disconnect(); } catch (e) { } retry();
+        }, onSuccess: function () {
+          if (gen !== NET.generation || !NET.signalsActive) return;
+          b.ready = true; b.attempts = 0; NET.signalStatus = 'mqtt'; NET.discover();
+        } });
+      }
+    });
+  } catch (e) { retry(); }
+};
+NET.receiveSignal = function (m, route) {
+  if (NET.status === 'error' || !m || m.v !== 1 || m.room !== NET.code ||
+      !/^[a-f0-9]{24}$/.test(m.from) || m.from === NET.session ||
+      (m.to !== '*' && m.to !== NET.session) || typeof m.mid !== 'string' || m.mid.length > 80 ||
+      !m.body || typeof m.body !== 'object') return;
+  if (NET.seen.has(m.mid)) return;
+  NET.seen.set(m.mid, true);
+  if (NET.seen.size > 512) NET.seen.delete(NET.seen.keys().next().value);
+  var c = NET.peers[m.from], body = m.body;
+  if (NET.mode === 'host' && m.type === 'join') {
+    if (c && !c.closed) {
+      if (!c.open && c.pc.localDescription) NET.describe(c);
+      return;
+    }
+    if (Object.keys(NET.peers).length >= 4) { NET.signal('reject', m.from, { why: 'Комната полна (макс. 5 игроков)' }); return; }
+    c = NET.makeConn(m.from, NET.token(), route === 'local');
+    NET.hostAccept(c);
+    NET.attachChannel(c, c.pc.createDataChannel('control', { ordered: true }));
+    NET.attachChannel(c, c.pc.createDataChannel('state', { ordered: false, maxRetransmits: 0 }));
+    NET.enqueue(c, async function () {
+      await c.pc.setLocalDescription(await c.pc.createOffer()); NET.describe(c);
+    });
+    return;
+  }
+  if (NET.mode === 'client' && m.type === 'reject' && !NET.conn) {
+    NET.fail(String(body.why || 'Подключение отклонено.').slice(0, 200)); return;
+  }
+  if (m.type === 'offer' && NET.mode === 'client') {
+    if (!body.sdp || body.sdp.type !== 'offer' || typeof body.sdp.sdp !== 'string' || !/^[a-f0-9]{24}$/.test(body.sid)) return;
+    if (NET.conn && (NET.conn.peer !== m.from || NET.conn.sid !== body.sid)) return;
+    if (!c) {
+      c = NET.makeConn(m.from, body.sid, route === 'local'); NET.conn = c;
+      c.pc.ondatachannel = function (e) { NET.attachChannel(c, e.channel); };
+    }
+    NET.enqueue(c, async function () {
+      if (!c.pc.remoteDescription) {
+        await c.pc.setRemoteDescription(body.sdp); await NET.flushICE(c);
+        await c.pc.setLocalDescription(await c.pc.createAnswer());
+      }
+      NET.describe(c);
+    });
+    return;
+  }
+  if (m.type === 'ice' && !c && NET.mode === 'client') {
+    if (!/^[a-f0-9]{24}$/.test(body.sid) || !body.candidate) return;
+    var key = m.from + ':' + body.sid;
+    var list = NET.earlyICE.get(key) || [];
+    if (list.length < 64) list.push(body.candidate);
+    NET.earlyICE.set(key, list);
+    if (NET.earlyICE.size > 8) NET.earlyICE.delete(NET.earlyICE.keys().next().value);
+    return;
+  }
+  if (!c || c.closed || c.sid !== body.sid || c.open) return;
+  if (m.type === 'answer' && NET.mode === 'host' && body.sdp && body.sdp.type === 'answer') {
+    NET.enqueue(c, async function () {
+      if (!c.pc.remoteDescription) { await c.pc.setRemoteDescription(body.sdp); await NET.flushICE(c); }
+    });
+  } else if (m.type === 'ice' && body.candidate) {
+    NET.enqueue(c, async function () {
+      if (c.pc.remoteDescription) await c.pc.addIceCandidate(body.candidate);
+      else if (c.ice.length < 64) c.ice.push(body.candidate);
+    });
+  }
+};
+NET.describe = function (c) {
+  if (c.closed || c.open || !c.pc.localDescription) return;
+  NET.signal(c.pc.localDescription.type, c.peer, {
+    sid: c.sid, sdp: c.pc.localDescription.toJSON()
+  }, c);
+};
+NET.enqueue = function (c, job) {
+  c.chain = c.chain.then(function () { if (!c.closed) return job(); }).catch(function (e) {
+    if (!c.closed) NET.connectionError(c, 'Ошибка согласования WebRTC: ' + e.message);
+  });
+};
+NET.flushICE = async function (c) {
+  while (c.ice.length && !c.closed) await c.pc.addIceCandidate(c.ice.shift());
+};
+NET.makeConn = function (peer, sid, local) {
+  var pc = new RTCPeerConnection({ iceServers: local ? [] : NET_ICE });
+  var key = peer + ':' + sid;
+  var c = { peer: peer, sid: sid, pc: pc, local: local, dc: null, fast: null,
+    open: false, closed: false, _gid: 0, chain: Promise.resolve(),
+    ice: NET.earlyICE.get(key) || [], inputSeq: -1, lastInput: 0 };
+  NET.earlyICE.delete(key); NET.peers[peer] = c;
+  c.close = function () { NET.closeConn(c); };
+  pc.onicecandidate = function (e) {
+    if (e.candidate && !c.closed && !c.open)
+      NET.signal('ice', peer, { sid: sid, candidate: e.candidate.toJSON() }, c);
+  };
+  pc.onconnectionstatechange = function () {
+    if (c.closed) return;
+    if (pc.connectionState === 'failed') NET.connectionError(c, 'Прямое P2P-соединение не установлено. NAT/Firewall может требовать TURN.');
+    else if (pc.connectionState === 'disconnected' && !c.disconnectTimer) {
+      c.disconnectTimer = NET.later(function () {
+        c.disconnectTimer = null;
+        if (!c.closed && pc.connectionState === 'disconnected') NET.connectionError(c, 'Связь с игроком потеряна.');
+      }, 8000);
+    }
+  };
+  c.timeout = NET.later(function () {
+    if (!c.open) NET.connectionError(c, 'Истекло время подключения WebRTC. Проверьте сеть; может требоваться TURN.');
+  }, 25000);
+  return c;
+};
+NET.attachChannel = function (c, dc) {
+  if (dc.label === 'control' && !c.dc) c.dc = dc;
+  else if (dc.label === 'state' && !c.fast) c.fast = dc;
+  else { dc.close(); return; }
+  dc.onopen = function () {
+    if (c.closed || c.open || !c.dc || !c.fast || c.dc.readyState !== 'open' || c.fast.readyState !== 'open') return;
+    c.open = true; clearTimeout(c.timeout);
+    if (NET.mode === 'host') {
+      if (G && zone) NET.welcome(c);
+      else { NET.pendingGuests.push(c); NET.sendTo(c, { t: 'wait' }); }
+    } else {
+      clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null;
+      NET.closeSignals(); NET.send({ t: 'hi' });
+    }
+  };
+  dc.onmessage = function (e) {
+    if (c.closed || typeof e.data !== 'string' || e.data.length > 65536) return;
+    try {
+      var m = JSON.parse(e.data);
+      if (!m || typeof m !== 'object') return;
+      var transient = m.t === 's' || m.t === 'mv';
+      if (transient !== (dc === c.fast)) return;
+      if (m.t === 'ping') { NET.sendTo(c, { t: 'pong', at: m.at }); return; }
+      if (m.t === 'pong') { if (typeof m.at === 'number') NET.ping = Math.round((NET.now() - m.at) * 1000); return; }
+      if (NET.mode === 'host') NET.hostMsg(c, m); else NET.clientMsg(m);
+    } catch (e) { console.warn('Некорректный сетевой пакет', e); }
+  };
+  dc.onclose = function () { if (!c.closed) NET.connectionError(c, 'Игрок отключился.'); };
+  dc.onerror = function () { if (!c.closed) NET.connectionError(c, 'Ошибка канала WebRTC.'); };
+};
+NET.closeConn = function (c) {
+  if (!c || c.closed) return;
+  c.closed = true; c.open = false;
+  clearTimeout(c.timeout); clearTimeout(c.disconnectTimer);
+  [c.dc, c.fast].forEach(function (dc) { if (dc) { dc.onclose = dc.onerror = null; try { dc.close(); } catch (e) { } } });
+  c.pc.onicecandidate = c.pc.onconnectionstatechange = c.pc.ondatachannel = null;
+  c.pc.close();
+};
+NET.connectionError = function (c, msg) {
+  if (NET.mode === 'host') NET.dropConn(c);
+  else if (NET.status !== 'error') NET.fail(msg || 'Хост отключился.');
+};
+// Bfcache restores a page with closed connections; allow boot to run again.
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', function () { NET.cleanup(); NET.mode = 'solo'; NET.status = ''; });
+  window.addEventListener('pageshow', function (e) { if (e.persisted) NET.boot(); });
+}
+
 NET.mkEnt = function (id, name) {
   return {
     id: id, name: name, conn: null,
@@ -112,98 +406,21 @@ NET.mkEnt = function (id, name) {
   };
 };
 
-/* ---------- Запуск из URL-параметров ---------- */
-NET.boot = function () {
-  if (NET.mode !== 'solo') return;
-  try {
-    var q = new URLSearchParams(window.location.search);
-    var h = q.get('host'), j = q.get('join');
-    if (h) NET.startHost(NET.normCode(h));
-    else if (j) NET.startClient(NET.normCode(j));
-  } catch (e) { }
-};
+NET.hostAccept = function (conn) { NET.rate[conn.peer] = { n: 0, t: NET.now() }; };
 
-/* Фоновый keepalive для сигнального сервера PeerJS */
-NET.setupKeepalive = function () {
-  if (NET.keepaliveTimer) return;
-  NET.keepaliveTimer = setInterval(function () {
-    if (NET.peer && !NET.peer.destroyed) {
-      if (NET.peer.disconnected) {
-        try { NET.peer.reconnect(); } catch (e) { }
-      }
-    }
-  }, 4000);
-};
-
-/* ============================================================
-   ЛОГИКА ХОСТА
-   ============================================================ */
-NET.startHost = function (code) {
-  NET.mode = 'host';
-  NET.code = code || NET.genCode();
-  NET.status = 'connecting';
-  NET.statusText = 'СОЗДАНИЕ КОМНАТЫ ' + NET.code + '…';
-
-  /* Хост сразу инициализирует мир игры, чтобы гости не висели в ожидании */
-  if (typeof G !== 'undefined' && !G) {
-    if (typeof saveExists !== 'undefined' && saveExists && typeof continueGame === 'function') {
-      continueGame();
-    } else if (typeof newGame === 'function') {
-      newGame();
-    }
+NET.spawnPoint = function (slot) {
+  var offsets = [[18, 0], [-18, 0], [0, 18], [0, -18], [18, -18], [-18, -18], [18, 18], [-18, 18], [0, -36], [-36, 0], [36, 0], [0, 36], [0, 0]];
+  for (var i = 0; i < offsets.length; i++) {
+    var o = offsets[(i + slot) % offsets.length];
+    var p = { x: player.x + o[0], y: player.y + o[1], w: 16, h: 16 };
+    if (p.x < 0 || p.y < 0 || p.x + 16 > zone.w * TILE || p.y + 16 > zone.h * TILE || boxSolid(p.x, p.y, 16, 16)) continue;
+    var feet = feetBox(p);
+    if ((zone.def.exits || []).some(function (e) {
+      return rectsOverlap(feet.x, feet.y, feet.w, feet.h, e.x * TILE, e.y * TILE, e.w * TILE, e.h * TILE);
+    })) continue;
+    return p;
   }
-
-  if (typeof Peer === 'undefined') return NET.fail('PeerJS не загружен (нужен интернет)');
-  var peer;
-  try {
-    peer = new Peer('rpx-' + NET.code, { debug: 0, config: { iceServers: NET_ICE } });
-  } catch (e) { return NET.fail('Не удалось создать Peer: ' + e.message); }
-  NET.peer = peer;
-  NET.setupKeepalive();
-
-  peer.on('open', function () {
-    NET.status = 'open';
-    NET.updStatus();
-    NET.flushGuests();
-  });
-
-  peer.on('connection', NET.hostAccept);
-
-  peer.on('error', function (e) {
-    var t = e && e.type;
-    if (t === 'unavailable-id') NET.fail('Код комнаты занят. Вернитесь в лобби.');
-    else if (t === 'network' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed')
-      NET.fail('Нет связи с сигналингом PeerJS. Проверьте интернет.');
-    else if (t !== 'peer-unavailable') NET.fail('Ошибка сети: ' + (t || e));
-  });
-
-  peer.on('disconnected', function () {
-    try { peer.reconnect(); } catch (e) { }
-  });
-};
-
-NET.genCode = function () {
-  var a = new Uint8Array(6), s = '', i;
-  try { crypto.getRandomValues(a); }
-  catch (e) { for (i = 0; i < 6; i++) a[i] = (Math.random() * 256) | 0; }
-  for (i = 0; i < 6; i++) s += NET_AL[a[i] % NET_AL.length];
-  return s;
-};
-
-NET.hostAccept = function (conn) {
-  NET.rate[conn.peer] = { n: 0, t: 0 };
-
-  conn.on('open', function () {
-    if (G && zone) NET.welcome(conn);
-    else {
-      NET.pendingGuests.push(conn);
-      NET.sendTo(conn, { t: 'wait', msg: 'Хост запускает игровой мир…' });
-    }
-  });
-
-  conn.on('data', function (m) { NET.hostMsg(conn, m); });
-  conn.on('close', function () { NET.dropConn(conn); });
-  conn.on('error', function () { NET.dropConn(conn); });
+  return { x: player.x, y: player.y };
 };
 
 NET.welcome = function (conn) {
@@ -213,20 +430,19 @@ NET.welcome = function (conn) {
     NET.sendTo(conn, { t: 'wait', msg: 'Хост запускает игровой мир…' });
     return;
   }
-  if (NET.nextId > 4) {
+  var id = 1;
+  while (NET.conns[id] && id <= 4) id++;
+  if (id > 4) {
     NET.sendTo(conn, { t: 'bye', why: 'Комната полна (макс. 5 игроков)' });
     try { conn.close(); } catch (e) { }
     return;
   }
-  var id = NET.nextId++;
   var name = 'ИГРОК ' + (id + 1);
   var rp = NET.mkEnt(id, name);
   rp.conn = conn;
 
-  var offs = [[18, 0], [-18, 0], [0, 18], [0, -18]];
-  var o = offs[(id - 1) % offs.length];
-  var nx = player.x + o[0], ny = player.y + o[1];
-  if (nx < 0 || ny < 0 || boxSolid(nx, ny, 16, 16)) { nx = player.x; ny = player.y; }
+  var spawn = NET.spawnPoint(id - 1);
+  var nx = spawn.x, ny = spawn.y;
   rp.x = nx; rp.y = ny;
   rp.targetX = nx; rp.targetY = ny;
   rp.dir = player.dir;
@@ -234,7 +450,7 @@ NET.welcome = function (conn) {
   NET.conns[id] = conn;
   conn._gid = id;
 
-  NET.sendTo(conn, { t: 'w', id: id, name: name, s: NET.buildSnap() });
+  NET.sendTo(conn, { t: 'welcome', id: id, name: name, s: NET.buildSnap() });
   toast(name + ' подключился!');
   sfx('key');
   NET.updStatus();
@@ -249,12 +465,13 @@ NET.flushGuests = function () {
 
 NET.dropConn = function (conn) {
   if (!conn) return;
+  if (NET.peers[conn.peer] === conn) delete NET.peers[conn.peer];
   var gid = conn._gid;
   try { conn.close(); } catch (e) { }
   if (gid) {
     delete NET.conns[gid];
     if (remotePlayers[gid]) delete remotePlayers[gid];
-    delete NET.dlgCb[gid];
+    delete NET.dlgCb[conn.peer];
   }
   if (NET.rate[conn.peer]) delete NET.rate[conn.peer];
   for (var i = NET.pendingGuests.length - 1; i >= 0; i--)
@@ -270,7 +487,7 @@ NET.hostMsg = function (conn, m) {
   if (!m || typeof m !== 'object') return;
   var r = NET.rate[conn.peer];
   if (r) {
-    if (time - r.t >= 1) { r.t = time; r.n = 0; }
+    if (NET.now() - r.t >= 1) { r.t = NET.now(); r.n = 0; }
     if (++r.n > 160) {
       try { conn.close(); } catch (e) { }
       NET.dropConn(conn);
@@ -291,7 +508,8 @@ NET.hostMsg = function (conn, m) {
   if (!gid) return;
   var rp = remotePlayers[gid];
   if (t === 'mv') {
-    if (!rp) return;
+    if (!rp || !Number.isSafeInteger(m.seq) || m.seq <= conn.inputSeq) return;
+    conn.inputSeq = m.seq; conn.lastInput = NET.now();
     rp.input.u = !!m.u; rp.input.d = !!m.d;
     rp.input.l = !!m.l; rp.input.r = !!m.r;
     if (m.dr === 'up' || m.dr === 'down' || m.dr === 'left' || m.dr === 'right') rp.dir = m.dr;
@@ -301,7 +519,7 @@ NET.hostMsg = function (conn, m) {
     if (!rp) return;
     var k = m.k;
     if (k === 'act' || k === 'atk' || k === 'gun' || k === 'use' || k === 'bike' || k === 'respawn')
-      rp.cmds.push(k);
+      if (rp.cmds.length < 32) rp.cmds.push(k);
     return;
   }
   if (t === 'dlgend') {
@@ -312,6 +530,7 @@ NET.hostMsg = function (conn, m) {
 };
 
 NET.processCmds = function () {
+  if (NET.mode !== 'host') return;
   for (var gid in remotePlayers) {
     var rp = remotePlayers[gid];
     if (!rp.cmds.length) continue;
@@ -367,7 +586,7 @@ NET.buildSnap = function () {
     bl.push([Math.round(bullets[i].x), Math.round(bullets[i].y), bullets[i].friendly ? 1 : 0, bullets[i].col || '#ffd76a']);
   for (i = 0; i < toasts.length; i++) tst.push(toasts[i].txt);
   return {
-    t: 's', z: zone.id, ex: zone.entry.x, ey: zone.entry.y,
+    t: 's', seq: ++NET.snapSeq, epoch: NET.zoneEpoch, z: zone.id, ex: zone.entry.x, ey: zone.entry.y,
     ps: ps, en: en, dr: dr, sp: sp, it: zone.takenIds.slice(), b: bl, tst: tst,
     G: G, o: (state === 'gameover' || (G && G.hp <= 0)) ? 1 : 0
   };
@@ -375,13 +594,13 @@ NET.buildSnap = function () {
 
 NET.onZoneLoad = function () {
   if (typeof NET === 'undefined' || NET.mode !== 'host' || !player) return;
-  var offs = [[18, 0], [-18, 0], [0, 18], [0, -18]];
+  NET.zoneEpoch++;
+  NET.snapT = 0;
   var n = 0;
   for (var gid in remotePlayers) {
     var rp = remotePlayers[gid];
-    var o = offs[n % offs.length]; n++;
-    var nx = player.x + o[0], ny = player.y + o[1];
-    if (nx < 0 || ny < 0 || boxSolid(nx, ny, 16, 16)) { nx = player.x; ny = player.y; }
+    var spawn = NET.spawnPoint(n++);
+    var nx = spawn.x, ny = spawn.y;
     rp.x = nx; rp.y = ny;
     rp.targetX = nx; rp.targetY = ny;
     rp.moving = false; rp.riding = false;
@@ -389,84 +608,21 @@ NET.onZoneLoad = function () {
   }
 };
 
-/* ============================================================
-   ЛОГИКА КЛИЕНТА
-   ============================================================ */
-NET.startClient = function (code) {
-  NET.mode = 'client';
-  NET.code = code;
-  NET.status = 'connecting';
-  NET.statusText = 'ПОДКЛЮЧЕНИЕ К КОМНАТЕ ' + code + '…';
-
-  /* Таймер ожидания (watchdog): не зависать бесконечно */
-  if (NET.watchdogTimer) clearTimeout(NET.watchdogTimer);
-  NET.watchdogTimer = setTimeout(function () {
-    if (NET.mode === 'client' && NET.status === 'connecting') {
-      NET.fail('Не удалось подключиться к ' + code + '. Проверьте, в игре ли хост, или создайте комнату сами.');
-    }
-  }, 15000);
-
-  if (typeof Peer === 'undefined') return NET.fail('PeerJS не загружен (нужен интернет)');
-  var peer;
-  try {
-    peer = new Peer({ debug: 0, config: { iceServers: NET_ICE } });
-  } catch (e) { return NET.fail('Не удалось создать Peer: ' + e.message); }
-  NET.peer = peer;
-  NET.setupKeepalive();
-
-  peer.on('open', function () {
-    var conn;
-    try {
-      conn = peer.connect('rpx-' + code, { reliable: true, serialization: 'json' });
-    } catch (e) { return NET.fail('Не удалось соединиться: ' + e.message); }
-    NET.conn = conn;
-
-    try {
-      if (conn.peerConnection) {
-        conn.peerConnection.addEventListener('iceconnectionstatechange', function () {
-          var ics = conn.peerConnection.iceConnectionState;
-          if (ics === 'failed') {
-            NET.fail('Прямое P2P-соединение заблокировано сетью одного из игроков (NAT/Firewall).');
-          }
-        });
-      }
-    } catch (err) { }
-
-    conn.on('open', function () {
-      if (NET.watchdogTimer) { clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null; }
-      NET.hiT = 0;
-      NET.send({ t: 'hi' });
-    });
-    conn.on('data', function (m) { NET.clientMsg(m); });
-    conn.on('close', function () {
-      if (NET.status !== 'error') NET.fail('Хост отключился.');
-    });
-    conn.on('error', function () {
-      if (NET.status !== 'error') NET.fail('Ошибка соединения с хостом.');
-    });
-  });
-
-  peer.on('error', function (e) {
-    if (NET.watchdogTimer) { clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null; }
-    var t = e && e.type;
-    if (t === 'peer-unavailable') NET.fail('Комната ' + code + ' не найдена.');
-    else if (t === 'network' || t === 'server-error' || t === 'socket-error' || t === 'socket-closed')
-      NET.fail('Нет связи с сигналингом. Проверьте интернет.');
-    else NET.fail('Ошибка сети: ' + (t || e));
-  });
-};
-
 NET.clientMsg = function (m) {
   if (!m || typeof m !== 'object') return;
   var t = m.t;
-  if (t === 'w') {
+  if (t === 'welcome' || t === 'w') {
+    if (NET.status !== 'connecting' || !Number.isInteger(m.id) || m.id < 1 || m.id > 4) return;
+    if (!NET.validSnap(m.s) || !m.s.ps.some(function (p) { return p.i === m.id; })) {
+      NET.fail('Хост прислал некорректное начальное состояние.'); return;
+    }
     if (NET.watchdogTimer) { clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null; }
     NET.myId = m.id;
     NET.status = 'open';
     NET.statusText = 'КОМНАТА ' + NET.code;
     NET.applySnap(m.s, true);
   } else if (t === 's') {
-    NET.applySnap(m, false);
+    if (NET.status === 'open') NET.applySnap(m, false);
   } else if (t === 'wait') {
     NET.statusText = m.msg || 'ОЖИДАНИЕ ХОСТА…';
   } else if (t === 'dlg') {
@@ -485,11 +641,22 @@ NET.openGuestDialog = function (lines) {
 };
 
 /* ---------- Применение снапшота ---------- */
+NET.validSnap = function (s) {
+  return !!(s && s.G && typeof s.G === 'object' && Number.isFinite(s.G.hp) &&
+    RP.ZONES[s.z] && Number.isSafeInteger(s.seq) && Number.isSafeInteger(s.epoch) &&
+    Array.isArray(s.ps) && s.ps.length <= 5 && s.ps.every(function (p) {
+      return p && Number.isInteger(p.i) && p.i >= 0 && p.i <= 4 && Number.isFinite(p.x) && Number.isFinite(p.y);
+    }) && Array.isArray(s.en) && s.en.every(function (e) {
+      return e && Number.isSafeInteger(e.u) && ENEMY_DEF[e.t] && Number.isFinite(e.x) && Number.isFinite(e.y);
+    }) && Array.isArray(s.sp) && Array.isArray(s.it) && Array.isArray(s.dr) && Array.isArray(s.b));
+};
 NET.applySnap = function (s, isW) {
-  if (!s || !s.G || !s.z) return;
+  if (!NET.validSnap(s) || s.seq <= NET.lastSnap) return;
+  NET.lastSnap = s.seq;
   var prevHp = G ? G.hp : -1;
   var wasOver = NET.overPrev;
-  var zoneChanged = !isW && zone && s.z !== zone.id;
+  var zoneChanged = !isW && (!zone || s.z !== zone.id || s.epoch !== NET.lastEpoch);
+  NET.lastEpoch = s.epoch;
 
   G = s.G;
   if (!G.flags) G.flags = {};
@@ -498,7 +665,9 @@ NET.applySnap = function (s, isW) {
   if (!G.keys) G.keys = { pass: false, key: false };
 
   if (isW || zoneChanged) {
+    remotePlayers = {}; NET.selfTarget = null;
     loadZone(s.z, s.ex, s.ey);
+    zone.enemies = []; // Rebuild by host UID, including same-zone respawn.
     NET.hardSnap = true;
     if (isW) {
       state = 'play';
@@ -538,6 +707,7 @@ NET.applySnap = function (s, isW) {
     if (toasts.length > 4) toasts.splice(0, toasts.length - 4);
   }
 
+  if (!!s.o !== NET.overPrev) NET.hardSnap = true;
   var seen = {};
   for (i = 0; i < s.ps.length; i++) {
     var p = s.ps[i];
@@ -583,13 +753,10 @@ NET.correctSelf = function (p) {
   if (NET.hardSnap) {
     player.x = p.x; player.y = p.y;
     NET.hardSnap = false;
+    NET.selfTarget = null;
   } else {
-    var dx = p.x - player.x, dy = p.y - player.y;
-    if (Math.abs(dx) > 32 || Math.abs(dy) > 32) {
-      player.x = p.x; player.y = p.y;
-    } else {
-      player.x += dx * 0.25; player.y += dy * 0.25;
-    }
+    // Reconcile prediction gradually every frame, not in 20 Hz jumps.
+    NET.selfTarget = { dx: p.x - player.x, dy: p.y - player.y };
   }
   player.riding = !!p.r;
   if (p.b) player.buff = Math.max(player.buff, 1);
@@ -609,13 +776,6 @@ NET.upsertRemote = function (p) {
   }
   rp.targetX = p.x;
   rp.targetY = p.y;
-
-  /* Если смещение слишком большое (телепорт / спавн / вход в зону) — без сглаживания */
-  var d = Math.hypot(rp.targetX - rp.x, rp.targetY - rp.y);
-  if (d > 48) {
-    rp.x = p.x;
-    rp.y = p.y;
-  }
 
   rp.dir = p.d;
   rp.moving = !!p.m;
@@ -647,10 +807,6 @@ NET.syncEnemies = function (list) {
     }
     e.targetX = d.x;
     e.targetY = d.y;
-    if (Math.hypot(e.targetX - e.x, e.targetY - e.y) > 48) {
-      e.x = d.x;
-      e.y = d.y;
-    }
     e.hp = d.hp;
     e.st = d.st;
     e.anim = d.an;
@@ -665,7 +821,7 @@ NET.syncEnemies = function (list) {
 
 /* ---------- Клиентский игровой тик (предикшн ввода + плавный lerp) ---------- */
 NET.updateClient = function (dt) {
-  if (!G || !zone || !player) return;
+  if (NET.status !== 'open' || !G || !zone || !player) return;
   G.playtime += dt;
   toastThrottle = Math.max(0, toastThrottle - dt);
   stepPlayerTimers(player, dt);
@@ -690,87 +846,65 @@ NET.updateClient = function (dt) {
   else if (anyHit(K_PAUSE)) { state = 'pause'; pauseSel = 0; saveGame(); sfx('blip'); }
   if (anyHit(K_MUTE)) { musicOn = !musicOn; toast(musicOn ? 'Звук вкл' : 'Звук выкл'); }
 
-  /* ПЛАВНАЯ ИНТЕРПОЛЯЦИЯ других игроков (включая хоста) — убирает рывки/телепортации */
-  for (var gid in remotePlayers) {
-    var rp = remotePlayers[gid];
-    if (rp.targetX !== undefined) {
-      var rdx = rp.targetX - rp.x;
-      var rdy = rp.targetY - rp.y;
-      var dist = Math.hypot(rdx, rdy);
-      if (dist > 48) {
-        rp.x = rp.targetX;
-        rp.y = rp.targetY;
-      } else if (dist > 0.15) {
-        var step = Math.min(1, dt * 20);
-        rp.x += rdx * step;
-        rp.y += rdy * step;
-      } else {
-        rp.x = rp.targetX;
-        rp.y = rp.targetY;
-      }
-    }
-    var isMoving = rp.moving || (rp.targetX !== undefined && Math.hypot(rp.targetX - rp.x, rp.targetY - rp.y) > 0.3);
-    if (isMoving) rp.anim += dt * (rp.riding ? 12 : 8);
-    rp.atkFlash = Math.max(0, rp.atkFlash - dt);
-  }
-
-  /* Плавная интерполяция врагов */
-  if (zone && zone.enemies) {
-    for (var ei = 0; ei < zone.enemies.length; ei++) {
-      var en = zone.enemies[ei];
-      if (en.targetX !== undefined) {
-        var edx = en.targetX - en.x, edy = en.targetY - en.y;
-        var edist = Math.hypot(edx, edy);
-        if (edist > 48) {
-          en.x = en.targetX; en.y = en.targetY;
-        } else if (edist > 0.15) {
-          var estep = Math.min(1, dt * 18);
-          en.x += edx * estep;
-          en.y += edy * estep;
-        } else {
-          en.x = en.targetX; en.y = en.targetY;
-        }
-      }
-    }
-  }
-
   updateParticles(dt);
   updateCam(false);
 };
 
 /* ---------- Главный сетевой тик ---------- */
-NET.tick = function (dt) {
-  if (NET.mode === 'solo') return;
+NET.smoothClient = function (dt) {
+  if (NET.mode !== 'client' || NET.status !== 'open' || !zone) return;
+  var a = Math.min(1, Math.max(0, dt) * 20);
+  Object.keys(remotePlayers).forEach(function (gid) {
+    var rp = remotePlayers[gid];
+    rp.x += (rp.targetX - rp.x) * a;
+    rp.y += (rp.targetY - rp.y) * a;
+    if (rp.moving) rp.anim += dt * (rp.riding ? 12 : 8);
+    rp.atkFlash = Math.max(0, rp.atkFlash - dt);
+  });
+  zone.enemies.forEach(function (e) {
+    if (e.targetX !== undefined) {
+      e.x += (e.targetX - e.x) * a;
+      e.y += (e.targetY - e.y) * a;
+    }
+  });
+  if (player && NET.selfTarget) {
+    var dx = NET.selfTarget.dx * a, dy = NET.selfTarget.dy * a;
+    player.x += dx; player.y += dy;
+    NET.selfTarget.dx -= dx; NET.selfTarget.dy -= dy;
+  }
+};
 
+NET.tick = function (dt) {
+  if (NET.mode === 'solo' || NET.status === 'error') return;
   if (NET.mode === 'host') {
-    NET.processCmds();
+    // A missing release packet/tab suspension must not keep a guest walking.
+    Object.keys(NET.conns).forEach(function (id) {
+      var c = NET.conns[id], rp = remotePlayers[id];
+      if (rp && NET.now() - c.lastInput > 0.5)
+        rp.input = { u: false, d: false, l: false, r: false };
+    });
+    NET.processCmds(); NET.flushGuests();
     if (!G || !zone || NET.status !== 'open') return;
     NET.snapT -= dt;
     if (NET.snapT <= 0) {
-      NET.snapT = 1 / 20; /* 20 Гц: частое и плавное обновление снапшотов */
+      NET.snapT = Math.max(0, NET.snapT + 1 / 20);
       var snap = NET.buildSnap();
       for (var id in NET.conns) NET.sendTo(NET.conns[id], snap);
     }
     return;
   }
-
-  if (NET.status === 'connecting') {
-    NET.hiT -= dt;
-    if (NET.hiT <= 0) {
-      NET.hiT = 1.5;
-      NET.send({ t: 'hi' });
-    }
-    return;
-  }
   if (NET.status !== 'open' || !player) return;
-
-  /* Передача ввода хосту (при изменении + каждые 100 мс при удержании) */
-  var u = anyHeld(K_UP), d = anyHeld(K_DOWN), l = anyHeld(K_LEFT), r = anyHeld(K_RIGHT);
-  var sig = (u ? 1 : 0) + '' + (d ? 1 : 0) + (l ? 1 : 0) + (r ? 1 : 0) + player.dir;
+  NET.smoothClient(dt);
+  var active = state === 'play' && !document.hidden;
+  var u = active && anyHeld(K_UP), d = active && anyHeld(K_DOWN);
+  var l = active && anyHeld(K_LEFT), r = active && anyHeld(K_RIGHT);
+  var sig = [u, d, l, r, player.dir].join(',');
   NET.mvT -= dt;
   if (sig !== NET.lastMv || NET.mvT <= 0) {
-    NET.lastMv = sig;
-    NET.mvT = 0.1;
-    NET.send({ t: 'mv', u: u, d: d, l: l, r: r, dr: player.dir });
+    if (NET.send({ t: 'mv', seq: ++NET.inputSeq, u: u, d: d, l: l, r: r, dr: player.dir })) {
+      NET.lastMv = sig; NET.mvT = 0.1;
+    }
   }
+  NET.hiT -= dt;
+  if (NET.hiT <= 0) { NET.hiT = 2; NET.send({ t: 'ping', at: NET.now() }); }
 };

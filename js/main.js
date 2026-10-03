@@ -224,7 +224,7 @@ function boot() {
       else newGame();
     }
   }
-  setMusicTheme('title');
+  if (state === 'title') setMusicTheme('title');
   requestAnimationFrame(loop);
 }
 

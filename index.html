@@ -18,7 +18,8 @@
   </div>
   <div id="lobbyMsg"></div>
   <div class="lobbyHint">
-    Комната живёт в браузере хоста &middot; нужен интернет (сигналинг PeerJS)<br>
+    Комната живёт в браузере хоста &middot; WebRTC + MQTT<br>
+    Вкладки одного браузера соединяются без интернета<br>
     Общий мир: враги, сферы, квесты и HP — у всех одни<br>
     Закрытые корпоративные NAT могут блокировать прямое P2P-соединение
   </div>
@@ -40,7 +41,7 @@
   var inp = document.getElementById('codeIn');
   function join() {
     var c = (inp.value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-    if (c.length < 4) { msg.textContent = 'Введите код комнаты (мин. 4 символа)'; inp.focus(); return; }
+    if (c.length !== 6) { msg.textContent = 'Введите код комнаты из 6 символов'; inp.focus(); return; }
     go('game.html?join=' + c);
   }
   document.getElementById('btnJoin').onclick = join;
