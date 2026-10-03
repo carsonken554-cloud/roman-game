@@ -1,6 +1,6 @@
 /* Native WebRTC, host-authoritative co-op (one host + four guests).
  * BroadcastChannel handles same-origin tabs without any server. MQTT carries
- * discovery/SDP/ICE only; game packets ALWAYS use encrypted RTCDataChannels.
+ * discovery/SDP/ICE, with an encrypted MQTT fallback when direct ICE fails.
  * Optional TURN: set RP.NET_ICE before loading this file (never embed secrets).
  */
 var RP = (typeof window !== 'undefined')
@@ -18,10 +18,10 @@ var NET = RP.NET = {
   dlgCb: {}, remoteDlg: null, pendingGuests: [], rate: {},
   ended: false, hardSnap: false, overPrev: false, selfTarget: null,
   watchdogTimer: null, keepaliveTimer: null, timers: [],
-  bc: null, brokers: [], signalsActive: false, seen: new Map(), earlyICE: new Map(),
+  bc: null, brokers: [], signalsActive: false, seen: new Map(), earlyICE: new Map(), fragments: new Map(),
   generation: 0, session: '', signalSeq: 0, ping: null,
   signalStatus: '',
-  brokerURLs: ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
+  brokerURLs: ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/mqtt']
 };
 NET.now = function () { return performance.now() / 1000; };
 NET.token = function () {
@@ -49,6 +49,7 @@ NET.later = function (fn, ms) {
 };
 NET.sendTo = function (conn, obj) {
   if (!conn || conn.closed) return false;
+  if (conn.transport === 'mqtt') return NET.relaySend(conn, obj);
   var transient = obj.t === 's' || obj.t === 'mv';
   var dc = transient ? conn.fast : conn.dc;
   if (!dc || dc.readyState !== 'open') return false;
@@ -97,12 +98,13 @@ NET.cleanup = function () {
   NET.timers.forEach(clearTimeout); NET.timers = [];
   clearTimeout(NET.watchdogTimer); NET.watchdogTimer = null;
   clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null;
+  clearInterval(NET.relayServiceTimer); NET.relayServiceTimer = null;
   NET.closeSignals();
   Object.keys(NET.peers).forEach(function (k) { NET.closeConn(NET.peers[k]); });
   NET.peers = {}; NET.conns = {}; NET.conn = null;
   NET.pendingGuests = []; NET.dlgCb = {}; NET.rate = {};
   NET.remoteDlg = null; NET.selfTarget = null;
-  NET.seen.clear(); NET.earlyICE.clear();
+  NET.seen.clear(); NET.earlyICE.clear(); NET.fragments.clear();
   if (typeof remotePlayers !== 'undefined') remotePlayers = {};
 };
 NET.fail = function (msg) {
@@ -150,7 +152,7 @@ NET.startClient = function (code) {
   if (!NET.start('client', code)) return;
   state = 'title';
   NET.watchdogTimer = NET.later(function () {
-    if (NET.status !== 'open') NET.fail('Не удалось подключиться к ' + NET.code + '. Проверьте код, доступность брокеров и сеть хоста. NAT может требовать TURN.');
+    if (NET.status !== 'open') NET.fail('Не удалось подключиться к ' + NET.code + '. Проверьте код, открыта ли игра у хоста и доступность MQTT-брокеров.');
   }, 30000);
   NET.openSignals();
 };
@@ -163,17 +165,37 @@ NET.startClient = function (code) {
 NET.signal = function (type, to, body, conn) {
   var m = { v: 1, room: NET.code, from: NET.session, to: to || '*',
     mid: NET.session + ':' + (++NET.signalSeq), type: type, body: body || {} };
-  if (NET.bc) { try { NET.bc.postMessage(m); } catch (e) { } }
+  if (NET.bc && type !== 'relay') { try { NET.bc.postMessage(m); } catch (e) { } }
   if (conn && conn.local) return;
+  return NET.publish(m);
+};
+NET.publish = function (m) {
   var payload = JSON.stringify(m);
+  var packets = [payload];
+  if (new TextEncoder().encode(payload).length > 1000) {
+    var encoded = NET.b64(new TextEncoder().encode(payload)), total = Math.ceil(encoded.length / 700);
+    packets = [];
+    for (var i = 0; i < total; i++) packets.push(JSON.stringify({ v: 1, room: m.room, from: m.from, to: m.to,
+      mid: m.mid + '.' + i, type: 'part', body: { id: m.mid, n: i, total: total, data: encoded.slice(i * 700, (i + 1) * 700) } }));
+  }
+  var sent = false;
+  var relay = m.type === 'relay', statePacket = relay && m.body.state;
   NET.brokers.forEach(function (b) {
     if (!b.ready) return;
+    if (relay && (statePacket ? b.statePending > 0 : b.controlPending >= 32)) return;
     try {
-      var msg = new Paho.MQTT.Message(payload);
-      msg.destinationName = NET.topic; msg.qos = 1; msg.retained = false;
-      b.client.send(msg);
-    } catch (e) { b.ready = false; }
+      packets.forEach(function (packet) {
+        var msg = new Paho.MQTT.Message(packet);
+        msg.destinationName = NET.topic; msg.qos = relay ? 1 : 0; msg.retained = false;
+        if (relay) {
+          msg._rpxState = !!statePacket;
+          if (statePacket) b.statePending++; else b.controlPending++;
+        }
+        b.client.send(msg);
+      }); sent = true;
+    } catch (e) { if (b.retry) b.retry(e); }
   });
+  return sent;
 };
 NET.discover = function () {
   if (NET.mode === 'client' && NET.status === 'connecting' && !(NET.conn && NET.conn.open)) {
@@ -193,6 +215,7 @@ NET.openSignals = function () {
   }
   NET.discover();
   NET.keepaliveTimer = setInterval(NET.discover, 1500);
+  NET.relayServiceTimer = setInterval(NET.serviceRelay, 500);
   // Give same-browser tabs first chance: no STUN dependency on the local path.
   NET.later(function () {
     if (NET.mode === 'client' && NET.conn && NET.conn.local) return;
@@ -202,26 +225,38 @@ NET.openSignals = function () {
     if (NET.mode === 'client' && NET.conn && NET.conn.local) return;
     NET.connectBroker(1);
   }, 1100);
+  NET.later(function () {
+    if (NET.mode === 'client' && NET.conn && NET.conn.local) return;
+    NET.connectBroker(2);
+  }, 1800);
 };
 NET.connectBroker = function (index) {
-  if (!NET.signalsActive || (NET.mode === 'client' && NET.status !== 'connecting')) return;
+  if (!NET.signalsActive) return;
   if (typeof Paho === 'undefined' || !Paho.MQTT) {
     NET.signalStatus = 'MQTT-клиент не загружен; доступен локальный сигналинг'; return;
   }
   var b = NET.brokers[index] || (NET.brokers[index] = { ready: false, attempts: 0 });
   var gen = NET.generation, client;
-  function retry() {
+  function retry(error) {
     if (gen !== NET.generation || !NET.signalsActive || b.client !== client || b.retrying) return;
     b.ready = false; b.retrying = true;
+    b.error = error && (error.errorMessage || error.message) || 'Соединение с брокером потеряно';
     NET.signalStatus = 'Брокер недоступен; повторное подключение';
     NET.later(function () {
       b.retrying = false;
-      if (NET.mode === 'host' || NET.status === 'connecting') NET.connectBroker(index);
+      NET.connectBroker(index);
     }, Math.min(15000, 1000 * Math.pow(2, Math.min(++b.attempts, 4))));
   }
   try {
     client = new Paho.MQTT.Client(NET.brokerURLs[index], 'rpx_' + NET.session + '_' + index);
     b.client = client;
+    b.retry = retry;
+    b.statePending = b.controlPending = 0;
+    client.onMessageDelivered = function (msg) {
+      if (b.client !== client || msg.qos !== 1) return;
+      if (msg._rpxState) b.statePending = Math.max(0, b.statePending - 1);
+      else b.controlPending = Math.max(0, b.controlPending - 1);
+    };
     client.onConnectionLost = retry;
     client.onMessageArrived = function (msg) {
       if (gen !== NET.generation || msg.retained || msg.destinationName !== NET.topic || msg.payloadString.length > 65536) return;
@@ -236,7 +271,7 @@ NET.connectBroker = function (index) {
           try { client.disconnect(); } catch (e) { } retry();
         }, onSuccess: function () {
           if (gen !== NET.generation || !NET.signalsActive) return;
-          b.ready = true; b.attempts = 0; NET.signalStatus = 'mqtt'; NET.discover();
+          b.ready = true; b.attempts = 0; b.error = ''; NET.signalStatus = 'mqtt'; NET.discover();
         } });
       }
     });
@@ -247,10 +282,15 @@ NET.receiveSignal = function (m, route) {
       !/^[a-f0-9]{24}$/.test(m.from) || m.from === NET.session ||
       (m.to !== '*' && m.to !== NET.session) || typeof m.mid !== 'string' || m.mid.length > 80 ||
       !m.body || typeof m.body !== 'object') return;
+  if (m.type === 'part') { NET.receivePart(m); return; }
   if (NET.seen.has(m.mid)) return;
   NET.seen.set(m.mid, true);
   if (NET.seen.size > 512) NET.seen.delete(NET.seen.keys().next().value);
   var c = NET.peers[m.from], body = m.body;
+  if (c && !c.closed && body.sid === c.sid && !c.local) {
+    if (m.type === 'relay-hello') { NET.receiveRelayHello(c, body); return; }
+    if (m.type === 'relay') { NET.receiveRelay(c, body); return; }
+  }
   if (NET.mode === 'host' && m.type === 'join') {
     if (c && !c.closed) {
       if (!c.open && c.pc.localDescription) NET.describe(c);
@@ -276,6 +316,7 @@ NET.receiveSignal = function (m, route) {
       c = NET.makeConn(m.from, body.sid, route === 'local'); NET.conn = c;
       c.pc.ondatachannel = function (e) { NET.attachChannel(c, e.channel); };
     }
+    if (!c.local && body.key) NET.prepareRelayKey(c, body.key);
     NET.enqueue(c, async function () {
       if (!c.pc.remoteDescription) {
         await c.pc.setRemoteDescription(body.sdp); await NET.flushICE(c);
@@ -296,6 +337,7 @@ NET.receiveSignal = function (m, route) {
   }
   if (!c || c.closed || c.sid !== body.sid || c.open) return;
   if (m.type === 'answer' && NET.mode === 'host' && body.sdp && body.sdp.type === 'answer') {
+    if (!c.local && body.key) NET.prepareRelayKey(c, body.key);
     NET.enqueue(c, async function () {
       if (!c.pc.remoteDescription) { await c.pc.setRemoteDescription(body.sdp); await NET.flushICE(c); }
     });
@@ -308,13 +350,18 @@ NET.receiveSignal = function (m, route) {
 };
 NET.describe = function (c) {
   if (c.closed || c.open || !c.pc.localDescription) return;
-  NET.signal(c.pc.localDescription.type, c.peer, {
-    sid: c.sid, sdp: c.pc.localDescription.toJSON()
-  }, c);
+  function send() {
+    if (!c.closed && !c.open && c.pc.localDescription) NET.signal(c.pc.localDescription.type, c.peer, {
+      sid: c.sid, sdp: c.pc.localDescription.toJSON(), key: c.publicKey
+    }, c);
+  }
+  // Prepare fallback keys with SDP while signaling is healthy; fallback does
+  // not have to wait for another round trip after ICE has already failed.
+  if (c.local) send(); else NET.getRelayKeys(c).then(send).catch(function () { send(); });
 };
 NET.enqueue = function (c, job) {
-  c.chain = c.chain.then(function () { if (!c.closed) return job(); }).catch(function (e) {
-    if (!c.closed) NET.connectionError(c, 'Ошибка согласования WebRTC: ' + e.message);
+  c.chain = c.chain.then(function () { if (!c.closed && !c.rtcStopped) return job(); }).catch(function (e) {
+    if (!c.closed && !c.rtcStopped) NET.connectionError(c, 'Ошибка согласования WebRTC: ' + e.message);
   });
 };
 NET.flushICE = async function (c) {
@@ -325,7 +372,10 @@ NET.makeConn = function (peer, sid, local) {
   var key = peer + ':' + sid;
   var c = { peer: peer, sid: sid, pc: pc, local: local, dc: null, fast: null,
     open: false, closed: false, _gid: 0, chain: Promise.resolve(),
-    ice: NET.earlyICE.get(key) || [], inputSeq: -1, lastInput: 0 };
+    ice: NET.earlyICE.get(key) || [], inputSeq: -1, lastInput: 0,
+    transport: 'rtc', pending: new Map(), received: new Map(), tx: Promise.resolve(),
+    rx: Promise.resolve(), txSeq: 0, controlSeq: 0, nextControl: 1,
+    lastHeard: NET.now(), relayWanted: false, relayConfirmed: false, txQueued: 0 };
   NET.earlyICE.delete(key); NET.peers[peer] = c;
   c.close = function () { NET.closeConn(c); };
   pc.onicecandidate = function (e) {
@@ -345,6 +395,11 @@ NET.makeConn = function (peer, sid, local) {
   c.timeout = NET.later(function () {
     if (!c.open) NET.connectionError(c, 'Истекло время подключения WebRTC. Проверьте сеть; может требоваться TURN.');
   }, 25000);
+  if (!local) c.fallbackTimer = NET.later(function () {
+    if (!c.closed && !c.open) NET.beginRelay(c);
+  }, NET_ICE.some(function (server) {
+    return [].concat(server.urls || []).some(function (url) { return /^turns?:/.test(url); });
+  }) ? 15000 : 6000);
   return c;
 };
 NET.attachChannel = function (c, dc) {
@@ -353,25 +408,16 @@ NET.attachChannel = function (c, dc) {
   else { dc.close(); return; }
   dc.onopen = function () {
     if (c.closed || c.open || !c.dc || !c.fast || c.dc.readyState !== 'open' || c.fast.readyState !== 'open') return;
-    c.open = true; clearTimeout(c.timeout);
-    if (NET.mode === 'host') {
-      if (G && zone) NET.welcome(c);
-      else { NET.pendingGuests.push(c); NET.sendTo(c, { t: 'wait' }); }
-    } else {
-      clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null;
-      NET.closeSignals(); NET.send({ t: 'hi' });
-    }
+    NET.openConn(c, 'rtc');
   };
   dc.onmessage = function (e) {
-    if (c.closed || typeof e.data !== 'string' || e.data.length > 65536) return;
+    if (c.closed || c.transport !== 'rtc' || typeof e.data !== 'string' || e.data.length > 65536) return;
     try {
       var m = JSON.parse(e.data);
       if (!m || typeof m !== 'object') return;
       var transient = m.t === 's' || m.t === 'mv';
       if (transient !== (dc === c.fast)) return;
-      if (m.t === 'ping') { NET.sendTo(c, { t: 'pong', at: m.at }); return; }
-      if (m.t === 'pong') { if (typeof m.at === 'number') NET.ping = Math.round((NET.now() - m.at) * 1000); return; }
-      if (NET.mode === 'host') NET.hostMsg(c, m); else NET.clientMsg(m);
+      NET.receiveGame(c, m);
     } catch (e) { console.warn('Некорректный сетевой пакет', e); }
   };
   dc.onclose = function () { if (!c.closed) NET.connectionError(c, 'Игрок отключился.'); };
@@ -380,14 +426,216 @@ NET.attachChannel = function (c, dc) {
 NET.closeConn = function (c) {
   if (!c || c.closed) return;
   c.closed = true; c.open = false;
-  clearTimeout(c.timeout); clearTimeout(c.disconnectTimer);
+  clearTimeout(c.timeout); clearTimeout(c.disconnectTimer); clearTimeout(c.fallbackTimer);
+  c.pending.clear(); c.received.clear();
   [c.dc, c.fast].forEach(function (dc) { if (dc) { dc.onclose = dc.onerror = null; try { dc.close(); } catch (e) { } } });
   c.pc.onicecandidate = c.pc.onconnectionstatechange = c.pc.ondatachannel = null;
   c.pc.close();
 };
 NET.connectionError = function (c, msg) {
+  if (c.closed) return;
+  if (!c.local && c.transport !== 'mqtt') { NET.beginRelay(c); return; }
   if (NET.mode === 'host') NET.dropConn(c);
   else if (NET.status !== 'error') NET.fail(msg || 'Хост отключился.');
+};
+NET.receivePart = function (m) {
+  var p = m.body;
+  if (typeof p.id !== 'string' || p.id.length > 65 || !p.id.startsWith(m.from + ':') ||
+      !Number.isInteger(p.total) || p.total < 2 || p.total > 128 ||
+      !Number.isInteger(p.n) || p.n < 0 || p.n >= p.total ||
+      typeof p.data !== 'string' || p.data.length > 700 || !/^[A-Za-z0-9+/=]+$/.test(p.data) || NET.seen.has(p.id)) return;
+  NET.fragments.forEach(function (a, id) { if (NET.now() - a.at > 10) NET.fragments.delete(id); });
+  var a = NET.fragments.get(p.id);
+  if (!a) {
+    if (NET.fragments.size >= 32) NET.fragments.delete(NET.fragments.keys().next().value);
+    a = { from: m.from, to: m.to, total: p.total, parts: [], count: 0, at: NET.now() };
+    NET.fragments.set(p.id, a);
+  }
+  if (a.total !== p.total || a.from !== m.from || a.to !== m.to) return;
+  if (a.parts[p.n] === undefined) { a.parts[p.n] = p.data; a.count++; }
+  if (a.count !== a.total) return;
+  NET.fragments.delete(p.id);
+  try {
+    var full = JSON.parse(new TextDecoder().decode(NET.unb64(a.parts.join(''))));
+    if (full.mid === p.id && full.from === a.from && full.to === a.to && full.type !== 'part') NET.receiveSignal(full, 'mqtt');
+  } catch (e) { }
+};
+
+NET.openConn = function (c, transport) {
+  if (c.closed) return;
+  c.transport = transport; c.open = true; c.lastHeard = NET.now();
+  c.relayWanted = false;
+  clearTimeout(c.timeout); clearTimeout(c.fallbackTimer);
+  if (transport === 'mqtt') {
+    c.rtcStopped = true;
+    c.pc.onicecandidate = c.pc.onconnectionstatechange = c.pc.ondatachannel = null;
+    [c.dc, c.fast].forEach(function (dc) { if (dc) dc.onclose = dc.onerror = null; });
+    c.pc.close();
+  }
+  if (NET.mode === 'host') {
+    if (c._gid) NET.sendTo(c, NET.buildSnap());
+    else if (G && zone) NET.welcome(c);
+    else { NET.pendingGuests.push(c); NET.sendTo(c, { t: 'wait' }); }
+  } else {
+    // Internet connections keep broker subscriptions for recovery after ICE loss.
+    if (c.local) {
+      clearInterval(NET.keepaliveTimer); NET.keepaliveTimer = null; NET.closeSignals();
+    }
+    NET.sendTo(c, { t: 'hi' });
+  }
+};
+NET.receiveGame = function (c, m) {
+  if (!m || typeof m !== 'object' || typeof m.t !== 'string') return;
+  if (m.t === 'ping') { NET.sendTo(c, { t: 'pong', at: m.at }); return; }
+  if (m.t === 'pong') { if (Number.isFinite(m.at)) NET.ping = Math.round((NET.now() - m.at) * 1000); return; }
+  if (NET.mode === 'host') NET.hostMsg(c, m); else NET.clientMsg(m);
+};
+
+/* NAT fallback needs only outgoing WSS, not UDP, port forwarding or TURN accounts.
+ * ECDH P-256 + AES-GCM hides game packets from public broker subscribers.
+ * The invitation code still does not authenticate a player's identity.
+ * Reliable packets use ACK/retry/ordering; stale snapshots are never retransmitted.
+ */
+NET.b64 = function (bytes) { return btoa(String.fromCharCode.apply(null, new Uint8Array(bytes))); };
+NET.unb64 = function (s) { return Uint8Array.from(atob(s), function (v) { return v.charCodeAt(0); }); };
+NET.getRelayKeys = function (c) {
+  if (!c.keys) c.keys = crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey'])
+    .then(async function (keys) {
+      c.publicKey = await crypto.subtle.exportKey('jwk', keys.publicKey); return keys;
+    });
+  return c.keys;
+};
+NET.relayHello = function (c) {
+  if (c.closed || c.local) return;
+  c.lastHello = NET.now();
+  NET.getRelayKeys(c).then(function () {
+    if (!c.closed) NET.signal('relay-hello', c.peer, { sid: c.sid, key: c.publicKey }, c);
+  }).catch(function () {
+    if (!c.closed) { c.transport = 'mqtt'; NET.connectionError(c, 'Браузер не поддерживает защищённый резервный канал. Откройте игру по HTTPS.'); }
+  });
+};
+NET.beginRelay = function (c) {
+  if (c.closed || c.local || c.transport === 'mqtt') return;
+  if (!c.relayWanted) { c.relayWanted = true; c.relayStarted = NET.now(); }
+  if (NET.mode === 'client') NET.statusText = 'ПОДКЛЮЧЕНИЕ ЧЕРЕЗ РЕЗЕРВНЫЙ КАНАЛ…';
+  NET.relayHello(c);
+  if (c.aes) NET.openConn(c, 'mqtt');
+};
+NET.receiveRelayHello = function (c, body) {
+  if (!NET.prepareRelayKey(c, body.key)) return;
+  if (c.transport !== 'mqtt') { c.relayWanted = true; c.relayStarted = c.relayStarted || NET.now(); }
+  if (NET.now() - (c.lastHello || 0) > 1) NET.relayHello(c);
+  c.keyReady.then(function () { if (!c.closed && c.aes && c.transport !== 'mqtt') NET.openConn(c, 'mqtt'); });
+};
+NET.prepareRelayKey = function (c, k) {
+  if (!k || k.kty !== 'EC' || k.crv !== 'P-256' ||
+      !/^[A-Za-z0-9_-]{43}$/.test(k.x) || !/^[A-Za-z0-9_-]{43}$/.test(k.y)) return false;
+  var fingerprint = k.x + ':' + k.y;
+  if (c.remoteKey && c.remoteKey !== fingerprint) return false;
+  if (c.keyReady) return true;
+  c.remoteKey = fingerprint;
+  c.keyReady = NET.getRelayKeys(c).then(async function (keys) {
+    var remote = await crypto.subtle.importKey('jwk',
+      { kty: 'EC', crv: 'P-256', x: k.x, y: k.y, ext: true }, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    c.aes = await crypto.subtle.deriveKey({ name: 'ECDH', public: remote }, keys.privateKey,
+      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    if (!c.closed && c.relayWanted) NET.openConn(c, 'mqtt');
+  }).catch(function () {
+    if (!c.closed) { c.transport = 'mqtt'; NET.connectionError(c, 'Не удалось создать защищённый резервный канал.'); }
+  });
+  return true;
+};
+NET.relayAAD = function (c, from, to, seq, zip) {
+  return new TextEncoder().encode([NET.code, c.sid, from, to, seq, zip ? 1 : 0].join('|'));
+};
+NET.compressRelay = async function (data) {
+  if (data.length < 800 || typeof CompressionStream === 'undefined') return { data: data, zip: false };
+  var zipped = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer());
+  return zipped.length < data.length ? { data: zipped, zip: true } : { data: data, zip: false };
+};
+NET.expandRelay = async function (data) {
+  var reader = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate')).getReader();
+  var chunks = [], size = 0;
+  for (;;) {
+    var item = await reader.read(); if (item.done) break;
+    size += item.value.length;
+    if (size > 32000) { await reader.cancel(); throw Error('oversized relay packet'); }
+    chunks.push(item.value);
+  }
+  var out = new Uint8Array(size), at = 0;
+  chunks.forEach(function (chunk) { out.set(chunk, at); at += chunk.length; }); return out;
+};
+NET.relaySend = function (c, obj) {
+  if (!c.aes || c.closed) return false;
+  var transient = obj.t === 's' || obj.t === 'mv', ack = obj.t === '_ack';
+  // Limit public-broker traffic to 10 snapshots/s; direct WebRTC stays at 20 Hz.
+  if (obj.t === 's' && NET.now() - (c.lastRelaySnap || 0) < 0.095) return false;
+  if (c.txQueued >= (transient ? 1 : 64) || (!transient && !ack && c.pending.size >= 64)) return false;
+  var q = transient || ack ? 0 : ++c.controlSeq;
+  var data = new TextEncoder().encode(JSON.stringify({ q: q, m: obj }));
+  if (data.length > 32000) { NET.connectionError(c, 'Сетевой пакет слишком большой для резервного канала.'); return false; }
+  if (obj.t === 's') c.lastRelaySnap = NET.now();
+  c.txQueued++;
+  c.tx = c.tx.then(async function () {
+    if (c.closed) return;
+    var seq = ++c.txSeq, iv = crypto.getRandomValues(new Uint8Array(12));
+    var packed = await NET.compressRelay(data);
+    var encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv,
+      additionalData: NET.relayAAD(c, NET.session, c.peer, seq, packed.zip) }, c.aes, packed.data);
+    if (c.closed) return;
+    var body = { sid: c.sid, seq: seq, iv: NET.b64(iv), data: NET.b64(encrypted), zip: packed.zip, state: transient };
+    if (q) c.pending.set(q, { body: body, at: NET.now() });
+    NET.signal('relay', c.peer, body, c);
+  }).catch(function () {
+    if (!c.closed) NET.connectionError(c, 'Ошибка резервного канала.');
+  }).finally(function () { c.txQueued--; });
+  return true;
+};
+NET.receiveRelay = function (c, body) {
+  if (!c.keyReady || !Number.isSafeInteger(body.seq) || body.seq < 1 ||
+      typeof body.iv !== 'string' || body.iv.length !== 16 ||
+      typeof body.data !== 'string' || body.data.length > 44000 || c.rxQueued >= 128) return;
+  c.rxQueued = (c.rxQueued || 0) + 1;
+  c.rx = c.rx.then(async function () {
+    await c.keyReady;
+    if (c.closed || !c.aes) return;
+    var decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: NET.unb64(body.iv),
+      additionalData: NET.relayAAD(c, c.peer, NET.session, body.seq, body.zip) }, c.aes, NET.unb64(body.data));
+    if (body.zip) decrypted = await NET.expandRelay(decrypted);
+    if (c.closed) return;
+    var packet = JSON.parse(new TextDecoder().decode(decrypted)), q = packet.q, m = packet.m;
+    if (!Number.isSafeInteger(q) || q < 0 || !m || typeof m !== 'object') return;
+    c.lastHeard = NET.now(); c.relayConfirmed = true;
+    if (c.transport !== 'mqtt') NET.openConn(c, 'mqtt');
+    if (m.t === '_ack') { if (Number.isSafeInteger(m.q)) c.pending.delete(m.q); return; }
+    if (!q) { NET.receiveGame(c, m); return; }
+    if (q >= c.nextControl + 64) return;
+    NET.relaySend(c, { t: '_ack', q: q });
+    if (q < c.nextControl || c.received.has(q)) return;
+    c.received.set(q, m);
+    while (!c.closed && c.received.has(c.nextControl)) {
+      var next = c.received.get(c.nextControl); c.received.delete(c.nextControl++);
+      NET.receiveGame(c, next);
+    }
+  }).catch(function () { /* Ignore unauthenticated public-topic packets. */ })
+    .finally(function () { c.rxQueued--; });
+};
+NET.serviceRelay = function () {
+  Object.keys(NET.peers).forEach(function (id) {
+    var c = NET.peers[id], now = NET.now();
+    if (c.closed || c.local) return;
+    if ((c.relayWanted || (c.transport === 'mqtt' && !c.relayConfirmed)) && now - (c.lastHello || 0) > 1)
+      NET.relayHello(c);
+    if (c.relayWanted && now - c.relayStarted > 20) {
+      if (NET.mode === 'host') NET.dropConn(c); else NET.fail('Хост не отвечает по резервному каналу.');
+      return;
+    }
+    if (c.transport !== 'mqtt') return;
+    if (now - c.lastHeard > 15) { NET.connectionError(c, 'Связь с игроком потеряна.'); return; }
+    c.pending.forEach(function (p) {
+      if (now - p.at > 0.75) { p.at = now; NET.signal('relay', c.peer, p.body, c); }
+    });
+  });
 };
 // Bfcache restores a page with closed connections; allow boot to run again.
 if (typeof window !== 'undefined') {

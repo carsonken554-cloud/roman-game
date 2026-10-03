@@ -1,0 +1,25 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>MQTT packet diagnostics</title>
+<pre id="result">Connecting…</pre><script src="../js/paho-mqtt.min.js"></script><script>
+(async function () {
+  var result = document.getElementById('result'), received = [[], []], failures = [], clients = [];
+  var topic = 'rpx/test/' + crypto.randomUUID();
+  function show() { result.textContent = JSON.stringify({received:received, failures:failures}, null, 2); }
+  function connect(i) { return new Promise(function (resolve, reject) {
+    var c = new Paho.MQTT.Client('wss://test.mosquitto.org:8081/mqtt', 'rpx_diag_' + crypto.randomUUID()); clients.push(c);
+    c.onConnectionLost = function (e) { failures.push(e.errorMessage); show(); };
+    c.onMessageArrived = function (m) { received[i].push(m.payloadString.length); show(); };
+    c.connect({useSSL:true,mqttVersion:4,timeout:7,onFailure:reject,onSuccess:function () {
+      c.subscribe(topic,{qos:0,timeout:5,onSuccess:resolve,onFailure:reject});
+    }});
+  }); }
+  try {
+    await Promise.all([connect(0),connect(1)]);
+    for (var n of [50,500,1500,4000,8000]) {
+      var m = new Paho.MQTT.Message('x'.repeat(n)); m.destinationName=topic; m.qos=0; clients[0].send(m);
+      await new Promise(function (resolve) { setTimeout(resolve,500); });
+    }
+    await new Promise(function (resolve) { setTimeout(resolve,3000); }); show();
+  } catch(e) { failures.push(e.errorMessage||e.message); show(); }
+  finally { clients.forEach(function(c){try{c.disconnect()}catch(e){}}); }
+})();
+</script></html>

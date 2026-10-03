@@ -320,7 +320,7 @@ function renderHUD() {
   if (typeof NET !== 'undefined' && NET.mode !== 'solo') {
     var lbl = NET.mode === 'host'
       ? ('КОМНАТА ' + NET.code + ' · ' + (NET.countGuests() + 1) + ' ИГР. [КЛИК: ССЫЛКА]')
-      : ('КОМНАТА ' + NET.code + ' · ГОСТЬ');
+      : ('КОМНАТА ' + NET.code + ' · ГОСТЬ' + (NET.conn && NET.conn.transport === 'mqtt' ? ' · РЕЗЕРВНЫЙ КАНАЛ' : ''));
     textShadow(lbl, 4, VH - 6, '#7fe0a0', 'left', '7px monospace');
   }
 }

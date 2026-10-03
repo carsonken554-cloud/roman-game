@@ -3,7 +3,7 @@
  * Real RTC channels are used even when signaling/broker failures are simulated.
  */
 (async function () {
-  var frames = [], errors = [], relay = [], signalTypes = [];
+  var frames = [], errors = [], relay = [], signalTypes = [], relayPackets = [];
   var results = document.getElementById('results');
   function report(name, ok, detail) {
     var li = document.createElement('li'); li.className = ok ? 'ok' : 'bad';
@@ -16,14 +16,15 @@
     while (performance.now() < end) { if (fn()) return; await sleep(50); }
     throw Error('timeout: ' + fn.toString() + ' ' + frames.map(function (f) {
       var n = f.contentWindow.NET;
-      return n ? [n.mode, n.status, f.contentWindow.state, n.statusText, n.signalStatus, 'guests=' + n.countGuests(), 'brokers=' + n.brokers.map(function (b) { return b.ready + ':' + b.error; }).join(','), JSON.stringify(f.contentWindow.__signals), 'peers=' + Object.values(n.peers).map(function (c) { return [c.pc.connectionState,c.pc.signalingState,!!c.pc.remoteDescription].join('/'); }).join(','), 'queues=' + Object.values(f.contentWindow.remotePlayers).map(function (p) { return p.id + ':' + p.cmds.join(','); }).join('/')].join(' / ') : 'unloaded';
-    }).join(' | '));
+      return n ? [n.mode, n.status, f.contentWindow.state, n.statusText, n.signalStatus, 'guests=' + n.countGuests(), 'brokers=' + n.brokers.map(function (b) { return b.ready + ':' + b.error; }).join(','), JSON.stringify(f.contentWindow.__signals), 'peers=' + Object.values(n.peers).map(function (c) { return [c.pc.connectionState,c.pc.signalingState,!!c.pc.remoteDescription,c.transport,!!c.aes,c.relayWanted,c.sid].join('/'); }).join(','), 'queues=' + Object.values(f.contentWindow.remotePlayers).map(function (p) { return p.id + ':' + p.cmds.join(','); }).join('/')].join(' / ') : 'unloaded';
+    }).join(' | ') + ' sockets=' + JSON.stringify(frames.map(function(f){return f.contentWindow.wsMetrics;})));
   }
   var gameHTML = await (await fetch('../game.html')).text();
   var baseURL = new URL('../', location.href).href;
   // Absolute asset URLs also keep the browser's speculative preloader on the
   // correct path while it parses srcdoc (before applying the base element).
   gameHTML = gameHTML.replace(/(src|href)="((?:js|css)\/[^\"]+)"/g, function (_, attr, path) {
+    if (path.indexOf('js/network.js') === 0) path += (path.indexOf('?') >= 0 ? '&' : '?') + 'test=' + Date.now();
     return attr + '="' + baseURL + path + '"';
   });
   // This relay simulates two independent brokers, not game transport.
@@ -39,11 +40,22 @@
     Client.prototype.subscribe = function (topic, o) { this.topic = topic; setTimeout(o.onSuccess, 0); };
     Client.prototype.disconnect = function () { this.ready = false; };
     Client.prototype.send = function (m) {
-      var data = JSON.parse(m.payloadString); signalTypes.push(data.type);
-      if (window.dropNextAnswer && data.type === 'answer') {
+      var sender = this;
+      if (m.qos === 1) setTimeout(function () { if (sender.ready && sender.onMessageDelivered) sender.onMessageDelivered(m); }, 10);
+      var data = JSON.parse(m.payloadString), kind = data.type;
+      if (kind === 'part' && data.body.n === 0) {
+        var match = atob(data.body.data).match(/"type":"([a-z-]+)"/);
+        if (match) kind = match[1];
+      }
+      signalTypes.push(kind);
+      if (data.type === 'relay') {
+        relayPackets.push(data);
+        if (window.dropRelayFrom === data.from) { window.dropRelayFrom = null; return; }
+      }
+      if (window.dropNextAnswer && kind === 'answer') {
         window.dropNextAnswer = false; throw Error('simulated publish failure');
       }
-      var delay = data.type === 'offer' ? 120 : 0; // ICE before SDP.
+      var delay = kind === 'offer' ? 120 : 0; // ICE before SDP, including parts.
       relay.forEach(function (c) {
         if (!c.ready || c.url !== this.url || c.topic !== m.destinationName) return;
         [delay, delay + 5].forEach(function (d) {
@@ -57,11 +69,12 @@
   async function frame(kind, code, transport) {
     var f = document.createElement('iframe'); frames.push(f);
     var prelude = "window.addEventListener('error',function(e){parent.testError(e.message)});";
+    if (transport.indexOf('online') === 0) prelude += "window.wsMetrics={sent:{},received:{}};var NativeWS=window.WebSocket;window.WebSocket=function(url,p){var ws=new NativeWS(url,p),send=ws.send;ws.send=function(data){var k=data.byteLength;wsMetrics.sent[k]=(wsMetrics.sent[k]||0)+1;return send.call(ws,data)};ws.addEventListener('message',function(e){var k=e.data.byteLength;wsMetrics.received[k]=(wsMetrics.received[k]||0)+1});return ws};";
     if (transport === 'offline') prelude += "window.WebSocket=function(){throw Error('network intentionally blocked')};";
-    if (transport === 'mock') prelude += "window.BroadcastChannel=undefined;";
-    if (transport === 'online') prelude += "window.BroadcastChannel=undefined;";
+    if (transport !== 'offline') prelude += "window.BroadcastChannel=undefined;";
+    if (transport.indexOf('blocked') >= 0) prelude += "var NativeRTC=window.RTCPeerConnection;window.RTCPeerConnection=function(){return new NativeRTC({iceServers:[],iceTransportPolicy:'relay'})};";
     var html = gameHTML.replace('<head>', '<head><base href="' + baseURL + '"><script>' + prelude + '<\/script>');
-    if (transport === 'mock') html = html.replace('<script src="' + baseURL + 'js/network.js">', '<script>window.Paho=parent.mockPaho();<\/script><script src="' + baseURL + 'js/network.js">');
+    if (transport.indexOf('mock') === 0) html = html.replace(/<script src="([^"]*js\/network.js[^\"]*)">/, '<script>window.Paho=parent.mockPaho();<\/script><script src="$1">');
     f.srcdoc = html;
     document.getElementById('frames').appendChild(f);
     await until(function () { return f.contentWindow.NET && f.contentWindow.canvas; });
@@ -94,7 +107,47 @@
   window.testError = function (msg) { errors.push(msg); };
   function cleanup() {
     frames.forEach(function (f) { if (f.contentWindow.NET) f.contentWindow.NET.cleanup(); f.remove(); });
-    frames = []; relay = []; signalTypes = [];
+    frames = []; relay = []; signalTypes = []; relayPackets = [];
+  }
+  // Focused regression: ICE has no candidates, so MQTT must carry the game.
+  if (new URLSearchParams(location.search).has('quick')) {
+    try {
+      var localHost = await frame('host', 'LOCAL2', 'offline');
+      var localGuest = await frame('client', 'LOCAL2', 'offline');
+      await until(function () { return localGuest.NET.status === 'open'; });
+      report('Локальный WebRTC по-прежнему работает оффлайн', localGuest.NET.conn.transport === 'rtc');
+      cleanup(); window.primaryAvailable = true;
+      var transport = new URLSearchParams(location.search).has('public') ? 'online-blocked' : 'mock-blocked';
+      var h = await frame('host', 'R' + Math.random().toString(36).slice(2, 7).toUpperCase(), transport);
+      var g = await frame('client', h.NET.code, transport);
+      await until(function () { return g.NET.status === 'open'; }, 30000);
+      report('Вход без единого ICE-кандидата через резервный канал', g.NET.conn.transport === 'mqtt' && h.NET.countGuests() === 1);
+      report('Гость получил мир и перешёл в игру', g.G && g.zone.id === h.zone.id && g.state === 'play');
+      report('WebRTC закрыт, резервный канал зашифрован AES-GCM', g.NET.conn.pc.connectionState === 'closed' && g.NET.conn.aes.algorithm.name === 'AES-GCM');
+      if (transport === 'mock-blocked') report('В публичные сообщения не попадает открытый снапшот', relayPackets.length > 0 && relayPackets.every(function (p) { return !p.body.G && typeof p.body.data === 'string'; }));
+      var gid = g.NET.myId, executed = [], original = h.playerAttack;
+      h.playerAttack = function (p) { if (p.id === gid) executed.push('atk'); original(p); };
+      // Drop exactly this command, without competing movement heartbeats.
+      g.NET.tick = function () {};
+      window.dropRelayFrom = g.NET.session;
+      report('Команда принята резервным транспортом', g.NET.send({ t: 'cmd', k: 'atk' }));
+      await until(function () { return executed.length >= 1; }, transport === 'mock-blocked' ? 5000 : 14000);
+      await sleep(1200);
+      report('Потерянная команда повторяется и выполняется один раз', executed.length === 1);
+      await until(function () { return g.NET.conn.pending.size === 0; }, transport === 'mock-blocked' ? 5000 : 14000);
+      report('Подтверждённые команды удалены из очереди', g.NET.conn.pending.size === 0);
+      var seq = g.NET.lastSnap;
+      await until(function () { return g.NET.lastSnap > seq; });
+      report('Игровые снапшоты продолжают приходить через MQTT', g.NET.lastSnap > seq);
+      g.NET.conn.relayStarted = g.NET.now() - 21; g.NET.serviceRelay();
+      report('Установленный резервный канал не обрывается по таймеру согласования', g.NET.status === 'open');
+      g.NET.conn.lastHeard = g.NET.now() - 16; g.NET.serviceRelay();
+      report('Потеря хоста завершает соединение и освобождает ресурсы', g.NET.status === 'error' && g.NET.conn === null);
+      report('Ошибок JavaScript нет', errors.length === 0, errors.join(', '));
+      document.getElementById('status').textContent = 'Проверки блокировки WebRTC пройдены.';
+    } catch (e) { document.getElementById('status').textContent = 'ОШИБКА: ' + e.message; }
+    finally { cleanup(); }
+    return;
   }
   try {
     var host = await frame('host', 'LOC123', 'offline');
@@ -159,17 +212,17 @@
     await until(function () { return guest.NET.status === 'open'; }, 16000);
     report('Резервный MQTT работает при отказе основного, дубликатах и ICE до SDP', host.NET.countGuests() === 1 && !guest.NET.conn.local && signalTypes.includes('answer'));
     report('Сбой публикации Paho запускает восстановление', !window.dropNextAnswer);
-    report('MQTT передаёт только сигналинг', signalTypes.every(function (t) { return ['join', 'offer', 'answer', 'ice', 'reject'].includes(t); }));
-    report('После открытия канала гость закрывает сигналинг', guest.NET.bc === null && guest.NET.brokers.length === 0);
+    report('MQTT передаёт только сигналинг при рабочем P2P', signalTypes.every(function (t) { return ['join', 'offer', 'answer', 'ice', 'reject', 'part'].includes(t); }));
+    report('Интернет-гость сохраняет сигналинг для аварийного переключения', guest.NET.signalsActive && guest.NET.brokers.some(function (b) { return b.ready; }));
     host.NET.cleanup();
-    await until(function () { return guest.NET.status === 'error'; });
+    await until(function () { return guest.NET.status === 'error'; }, 30000);
     report('Отключение хоста освобождает ресурсы и показывает ошибку', guest.NET.conn === null && guest.state === 'title');
     cleanup(); window.primaryAvailable = true;
     host = await frame('host', 'FAST12', 'mock');
     guest = await frame('client', 'FAST12', 'mock');
     await until(function () { return guest.NET.status === 'open'; });
     await sleep(1600);
-    report('Отложенный резервный брокер не открывается после DataChannel', !guest.NET.signalsActive && guest.NET.brokers.length === 0);
+    report('Сигналинг остаётся готов к аварийному переключению', guest.NET.signalsActive && guest.NET.brokers.length > 0);
     window.primaryAvailable = false;
     report('Игровых ошибок JavaScript нет', errors.length === 0, errors.join(', '));
     document.getElementById('status').textContent = 'Все обязательные проверки пройдены.';
